@@ -1,102 +1,88 @@
-import { App } from "@octokit/app";
-import { verifyWebhookSignature } from "./lib/verify.js";
+const WORKER_URL = "myworker.workers.dev";
 
 export default {
-  /**
-   * @param {Request} request
-   * @param {Record<string, any>} env
-   */
-  async fetch(request, env) {
-
-    // wrangler secret put APP_ID
-    const appId = env.APP_ID;
-    // wrangler secret put WEBHOOK_SECRET
-    const secret = env.WEBHOOK_SECRET;
-
-    // The private-key.pem file from GitHub needs to be transformed from the
-    // PKCS#1 format to PKCS#8, as the crypto APIs do not support PKCS#1:
-    //
-    //     openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in private-key.pem -out private-key-pkcs8.pem
-    //
-    // Then set the private key
-    //
-    //     cat private-key-pkcs8.pem | wrangler secret put PRIVATE_KEY
-    //
-    const privateKey = env.PRIVATE_KEY;
-
-    // instantiate app
-    // https://github.com/octokit/app.js/#readme
-    const app = new App({
-      appId,
-      privateKey,
-      webhooks: {
-        secret,
-      },
-    });
-
-    app.webhooks.on("issues.opened", async ({ octokit, payload }) => {
-      await octokit.request(
-        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
-        {
-          owner: payload.repository.owner.login,
-          repo: payload.repository.name,
-          issue_number: payload.issue.number,
-          body:
-            "Hello there from [Cloudflare Workers](https://github.com/gr2m/cloudflare-worker-github-app-example/#readme)",
-        }
-      );
-    });
-
-    if (request.method === "GET") {
-      const { data } = await app.octokit.request("GET /app");
-
-      return new Response(
-        `<h1>Cloudflare Worker Example GitHub app</h1>
-
-<p>Installation count: ${data.installations_count}</p>
-    
-<p><a href="https://github.com/apps/cloudflare-worker-example">Install</a> | <a href="https://github.com/gr2m/cloudflare-worker-github-app-example/#readme">source code</a></p>`,
-        {
-          headers: { "content-type": "text/html" },
-        }
-      );
-    }
-
-    const id = request.headers.get("x-github-delivery");
-    const name = request.headers.get("x-github-event");
-    const signature = request.headers.get("x-hub-signature-256") ?? "";
-    const payloadString = await request.text();
-    const payload = JSON.parse(payloadString);
-
-    // Verify webhook signature
+  async fetch(request) {
     try {
-      await verifyWebhookSignature(payloadString, signature, secret);
-    } catch (error) {
-      app.log.warn(error.message);
-      return new Response(`{ "error": "${error.message}" }`, {
-        status: 400,
-        headers: { "content-type": "application/json" },
+      if (request.headers.get("x-relay-hop") === "1") {
+        return json({ e: "loop detected" }, 508);
+      }
+
+      const req = await request.json();
+
+      if (!req.u) {
+        return json({ e: "missing url" }, 400);
+      }
+
+      const targetUrl = new URL(req.u);
+
+      const BLOCKED_HOSTS = [
+        WORKER_URL,
+      ];
+
+      if (BLOCKED_HOSTS.some(h => targetUrl.hostname.endsWith(h))) {
+        return json({ e: "self-fetch blocked" }, 400);
+      }
+
+      const headers = new Headers();
+      if (req.h && typeof req.h === "object") {
+        for (const [k, v] of Object.entries(req.h)) {
+          headers.set(k, v);
+        }
+      }
+
+      headers.set("x-relay-hop", "1");
+
+      const fetchOptions = {
+        method: (req.m || "GET").toUpperCase(),
+        headers,
+        redirect: req.r === false ? "manual" : "follow"
+      };
+
+      if (req.b) {
+        const binary = Uint8Array.from(atob(req.b), c => c.charCodeAt(0));
+        fetchOptions.body = binary;
+      }
+
+      const resp = await fetch(targetUrl.toString(), fetchOptions);
+
+      // Read response safely (no stack overflow)
+      const buffer = await resp.arrayBuffer();
+      const uint8 = new Uint8Array(buffer);
+
+      let binary = "";
+      const chunkSize = 0x8000; // prevent call stack overflow
+
+      for (let i = 0; i < uint8.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(
+          null,
+          uint8.subarray(i, i + chunkSize)
+        );
+      }
+
+      const base64 = btoa(binary);
+
+      const responseHeaders = {};
+      resp.headers.forEach((v, k) => {
+        responseHeaders[k] = v;
       });
+
+      return json({
+        s: resp.status,
+        h: responseHeaders,
+        b: base64
+      });
+
+    } catch (err) {
+      return json({ e: String(err) }, 500);
     }
-
-    // Now handle the request
-    try {
-      await app.webhooks.receive({
-        id,
-        name,
-        payload,
-      });
-
-      return new Response(`{ "ok": true }`, {
-        headers: { "content-type": "application/json" },
-      });
-    } catch (error) {
-      app.log.error(error);
-
-      return new Response(`{ "error": "${error.message}" }`, {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      });
-    }
-  },
+  }
 };
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "content-type": "application/json"
+    }
+  });
+}
